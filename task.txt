@@ -1,0 +1,77 @@
+I am building a **secure, self-hosted, password-protected local file-sharing server and CLI application in Golang**, designed as a more secure and customizable alternative to tools like `npx serve` and `python3 -m http.server`. The application will allow a user to share any specified directory from their computer over a local network by executing a command such as `fileshare share ./documents --port 8000 --auth --read-only`, making the directory accessible to other devices connected to the same network through the host machine's IP address and configured port, but only after successful authentication. The system will follow a **single-process modular monolith architecture**, with clearly separated modules for CLI command processing, configuration management, HTTP server initialization, network security, authentication, session management, IP-based rate limiting, cooldown enforcement, filesystem operations, file streaming, logging, and graceful shutdown. The application will be developed primarily using Go's standard library, including `net/http` for HTTP request handling, `crypto/tls` for encrypted communication, `os.Root` for traversal-resistant filesystem access, `context` for cancellation and lifecycle management, and synchronization primitives such as `sync.Mutex`, `sync.RWMutex`, channels, and semaphores for concurrency control, with additional dependencies introduced only where necessary, such as Argon2id for secure password hashing. When the owner starts the application, the CLI will parse and validate the provided arguments, resolve and validate the directory, establish a root-confined filesystem handle, securely obtain the authentication password without exposing it through command-line arguments, initialize a salted password verifier, configure HTTPS certificates, create in-memory session and security-state managers, initialize HTTP routes and middleware, configure resource limits and server timeouts, bind to the specified network interface, and begin accepting connections. When another device accesses the server, its request will pass through the complete network and application security pipeline: TCP connection establishment, TLS negotiation and server-certificate verification, HTTP parsing, request validation, client IP identification, request admission controls, route matching, authentication middleware, authorization checks, and finally the appropriate application handler. The system will expose a minimal custom web interface, built using Go HTML templates and CSS and embedded into the executable, providing a password login page and a private directory browser without requiring a separate frontend framework or runtime. Authentication will use **password-based verification with Argon2id and opaque server-side sessions instead of JWT**, where a successful login generates a cryptographically random session token, stores its hashed representation and associated metadata in a concurrency-safe in-memory session store, and returns the token to the browser through an `HttpOnly`, `Secure`, `SameSite` cookie. Subsequent requests will use this session cookie rather than repeatedly submitting the password, and the authentication middleware will verify the session's existence, validity, permissions, idle timeout, absolute expiration, and revocation status before allowing access to protected routes. Public endpoints such as `GET /login` and `POST /login` will have their own security restrictions, while protected endpoints such as `GET /`, `GET /api/files`, `GET /api/download/{path...}`, and `POST /logout` will require valid authentication, ensuring that users cannot bypass the login page by directly requesting a file URL. One of the application's major security features will be an **IP-based anti-brute-force and automatic cooldown system**, which will maintain a concurrency-safe in-memory record for each client IP containing its normalized address, recent failed-login timestamps, current cooldown expiration, repeated-violation count, last activity, and number of in-flight authentication attempts. The system will use a configurable sliding-window algorithm, initially allowing a maximum of five incorrect password attempts within ten minutes, after which the source IP will be temporarily blocked from making additional login attempts for fifteen minutes. Repeated violations may trigger exponential cooldown escalation, such as fifteen, thirty, and sixty minutes, with a configurable maximum duration and expiration of old violation history. Every incoming login request will first pass through a per-IP request-rate limiter, a cooldown-state check, and a global authentication admission controller before expensive password verification is performed. If the IP is currently blocked, the server will immediately return HTTP `429 Too Many Requests` with a `Retry-After` header indicating the remaining cooldown period, without performing password hashing. Incorrect credentials below the configured threshold will return HTTP `401 Unauthorized`, and the failed attempt will be recorded atomically; a successful login will create an authenticated session and update the relevant security state. To prevent attackers from bypassing the protection by sending many parallel login attempts, the admission controller will reserve an authentication slot before password verification, enforce a configurable number of simultaneous attempts per IP, and perform the threshold check and state transitions under appropriate synchronization, while releasing locks before computationally expensive password verification. A separate global rate limiter and bounded semaphore will restrict the total number of password verifications across all IP addresses, preventing excessive CPU and memory consumption even when an attacker changes IP addresses or distributes requests across multiple devices. The application will identify clients using the actual TCP remote address when directly deployed on the LAN and will not trust arbitrary `X-Forwarded-For` headers; forwarded-address handling will only be enabled for explicitly trusted reverse proxies. The architecture will account for shared public IPs, NAT, IPv6 address rotation, memory exhaustion, intentional lockout attacks, and the limitations of treating IP addresses as permanent client identities. The IP blocking mechanism will primarily restrict new login attempts rather than automatically terminate unrelated authenticated sessions, while optional owner-controlled session revocation and IP allowlisting may be provided for stronger restrictions. After authentication, the **file-service layer will enforce read-only, root-confined filesystem access**, ensuring that clients can browse and download only files belonging to the explicitly shared directory. File requests will undergo path normalization, logical authorization, hidden-file and exclusion-policy checks, and secure filesystem operations using a retained `os.Root` handle to prevent directory traversal and symbolic-link escapes outside the configured root. The service will avoid unsafe path concatenation and time-of-check/time-of-use vulnerabilities, while also recognizing that root confinement does not replace operating-system permissions or prevent exposure of files deliberately mounted or hard-linked into the shared directory. Upon receiving an authorized download request, the server will open the requested file safely, validate its type, obtain its metadata, apply appropriate HTTP headers such as `Content-Disposition`, `X-Content-Type-Options`, and cache-control policies, and stream the file directly from its file descriptor to the client over HTTPS using bounded memory rather than loading the entire file into RAM. It may additionally support HTTP `HEAD`, byte-range requests, resumable downloads, and concurrent transfers, with every request independently passing authentication and authorization. Since Go's HTTP server handles multiple connections concurrently, the application will use goroutine-based request handling while protecting shared session and security state with carefully scoped synchronization, employing bounded semaphores for computationally expensive operations and large file transfers rather than creating unnecessary worker pools for every request. Request-scoped `context.Context` objects will propagate cancellations and deadlines, ensuring that disconnected clients do not leave unnecessary file transfers, blocked operations, or leaked resources running. The server will enforce appropriate HTTP header and body-size limits, read and idle timeouts, connection and transfer-concurrency limits, and a bounded number of tracked IP and session records. Background maintenance tasks will periodically clean up expired sessions, stale IP records, and cooldown histories, while expiration will also be validated synchronously during requests so that security decisions do not depend on cleanup scheduling. **No external database, Redis instance, separate application server, or cloud service will be required for the initial implementation**, as active sessions, IP cooldowns, and rate-limit state will be stored in memory and all shared files will remain on the host computer's filesystem; restarting the application will therefore invalidate existing sessions and reset temporary cooldown records, which is acceptable for the initial single-instance use case. The system will also include structured logging and observability for successful and failed authentication attempts, source IP addresses, cooldown activation and expiration, session activity, active downloads, bytes transferred, request latency, resource utilization, and server lifecycle events, without recording plaintext passwords, session tokens, or other sensitive credentials. For operational control, the CLI may eventually provide commands to inspect server status, view temporarily blocked IP addresses, revoke sessions, clear cooldowns, configure authentication policies, and stop sharing. Network exposure will be controlled by binding to a specific LAN interface or loopback address, avoiding unintended exposure through all available interfaces, and HTTPS will require a certificate valid for the selected hostname or IP address and trusted by the connecting devices, rather than relying on insecure HTTP or ignored certificate warnings. The application will implement graceful shutdown by stopping new connections and admissions, allowing existing operations a bounded period to complete, cancelling remaining requests, releasing file descriptors and concurrency permits, stopping maintenance tasks, and flushing logs before exiting. The project will be organized into separate Go packages such as `cmd/fileshare`, `internal/app`, `internal/cli`, `internal/config`, `internal/server`, `internal/auth`, `internal/security`, `internal/files`, `internal/telemetry`, and `internal/maintenance`, with the application bootstrap acting as the composition root responsible for initializing dependencies and connecting components through narrowly defined interfaces such as `Authenticator`, `SessionStore`, `IPGuard`, `RateLimiter`, and `FileService`. The implementation will be validated through unit tests, integration tests, concurrency and race-detector tests, fuzz testing for malicious filesystem paths, brute-force simulations, simultaneous authentication attempts, denial-of-service and resource-exhaustion tests, large-file streaming tests, session expiration tests, and graceful-shutdown scenarios. **The complete end-to-end architecture will therefore follow the flow: Owner executes CLI → Configuration and Security Initialization → TCP/TLS Server → HTTP Request Admission → Client IP Identification → Per-IP Rate Limiting and Cooldown Enforcement → Global Authentication Admission → Password Verification → Secure Session Creation or Validation → Route Authorization → Root-Confined Filesystem Access → Bounded File Streaming → Encrypted HTTP Response**, supported by structured logging, lifecycle management, and resource cleanup. The final objective is to deliver a lightweight, portable, single-binary Go application that provides the convenience of a simple local file server while incorporating production-inspired backend engineering principles, including secure authentication, session management, layered network defenses, concurrent state synchronization, abuse prevention, filesystem isolation, resource-bounded request processing, observability, and reliable lifecycle management.
+fileshare/
+│
+├── cmd/
+│   └── fileshare/
+│       └── main.go
+│
+├── internal/
+│   │
+│   ├── app/
+│   │   ├── app.go
+│   │   ├── bootstrap.go
+│   │   └── lifecycle.go
+│   │
+│   ├── cli/
+│   │   ├── root.go
+│   │   ├── share.go
+│   │   ├── status.go
+│   │   └── version.go
+│   │
+│   ├── config/
+│   │   ├── config.go
+│   │   └── validate.go
+│   │
+│   ├── server/
+│   │   ├── server.go
+│   │   ├── router.go
+│   │   ├── middleware.go
+│   │   └── handlers.go
+│   │
+│   ├── auth/
+│   │   ├── service.go
+│   │   ├── password.go
+│   │   ├── session.go
+│   │   ├── store.go
+│   │   └── middleware.go
+│   │
+│   ├── security/
+│   │   ├── ip_tracker.go
+│   │   ├── cooldown.go
+│   │   ├── rate_limiter.go
+│   │   ├── admission.go
+│   │   ├── tls.go
+│   │   └── headers.go
+│   │
+│   ├── files/
+│   │   ├── service.go
+│   │   ├── handler.go
+│   │   ├── filesystem.go
+│   │   ├── policy.go
+│   │   └── transfer.go
+│   │
+│   ├── telemetry/
+│   │   ├── logger.go
+│   │   ├── metrics.go
+│   │   └── audit.go
+│   │
+│   └── maintenance/
+│       └── cleanup.go
+│
+├── web/
+│   ├── templates/
+│   │   ├── login.html
+│   │   ├── files.html
+│   │   └── error.html
+│   └── static/
+│       └── style.css
+│
+├── tests/
+│   ├── integration/
+│   └── security/
+│
+├── go.mod
+├── go.sum
+└── README.md
+
+diagram - file:///home/bugulnoz/Downloads/mermaid-diagram.png
